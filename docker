@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# docker wrapper to block bind-mounts of protected host paths
+# install as /usr/local/bin/docker and ensure /usr/bin is after /usr/local/bin
+# real docker binary (adjust if different):
+REAL_DOCKER=/usr/bin/docker
+
+# deny list (prefixes). Any resolved host path under any of these -> rejected.
+DENY_PREFIXES=(
+  /etc
+  /root
+  /boot
+  /proc
+  /sys
+  /dev
+  /run
+  /var/run
+  /var/lib
+  /bin
+  /sbin
+  /usr
+  /lib
+  /lib64
+  /selinux
+)
+
+# allowed prefixes (if you want an allowlist approach, change logic below)
+ALLOWED_PREFIXES=(
+  /home
+  /srv
+  /opt
+  /mnt
+  /media
+  /tmp
+)
+
+# helper: normalize path (handles relative paths)
+normpath() {
+  local p="$1"
+  # use realpath if available; fallback to readlink -f, then naive fallback
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m "$p" 2>/dev/null || printf "%s" "$p"
+  elif command -v readlink >/dev/null 2>&1; then
+    readlink -f "$p" 2>/dev/null || printf "%s" "$p"
+  else
+    # naive: prefix with pwd if relative
+    case "$p" in
+      /*) printf "%s" "$p" ;;
+      *) printf "%s/%s" "$PWD" "$p" ;;
+    esac
+  fi
+}
+
+# collect host paths from args
+HOST_PATHS=()
+
+# parse args to extract -v, --volume and --mount host sources
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+  a="${args[$i]}"
+
+  # --volume=host:container or --volume host:container
+  if [[ "$a" == --volume=* ]]; then
+    val="${a#--volume=}"
+    HOST_PATHS+=("${val%%:*}")
+  elif [[ "$a" == -v* && "$a" != "-v" ]]; then
+    # could be -v/host:cont or -vhost:cont
+    val="${a#-v}"
+    HOST_PATHS+=("${val%%:*}")
+  elif [[ "$a" == "-v" ]]; then
+    next="${args[$((i+1))]}"
+    if [ -n "$next" ]; then
+      HOST_PATHS+=("${next%%:*}")
+      i=$((i+1))
+    fi
+  # --mount type=bind,source=/host/path,target=/... or --mount=...
+  elif [[ "$a" == --mount=* ]]; then
+    m="${a#--mount=}"
+    # find source=... inside
+    if [[ "$m" =~ source=([^,]+) ]]; then
+      HOST_PATHS+=("${BASH_REMATCH[1]}")
+    fi
+  elif [[ "$a" == "--mount" ]]; then
+    next="${args[$((i+1))]}"
+    if [ -n "$next" ]; then
+      m="$next"
+      if [[ "$m" =~ source=([^,]+) ]]; then
+        HOST_PATHS+=("${BASH_REMATCH[1]}")
+      fi
+      i=$((i+1))
+    fi
+  fi
+
+  i=$((i+1))
+done
+
+# also handle compose file override via DOCKER_HOST? (not here)
+
+# resolve and check
+for p in "${HOST_PATHS[@]}"; do
+  # ignore anonymous volumes (they don't contain colon): already we only take left part; but skip empty or named volumes
+  if [ -z "$p" ]; then
+    continue
+  fi
+  # skip Docker named volumes (no leading /)
+  case "$p" in
+    /*) ;;
+    *) 
+      # relative or named volume; relative paths like ./foo should be checked below if they start with '.' or '/'
+      # if it looks like a named volume (no slash), skip
+      if [[ "$p" != .* && "$p" != ../* ]]; then
+        continue
+      fi
+      ;;
+  esac
+
+  # if relative (starts with . or ..) make absolute relative to PWD
+  if [[ "$p" == .* || "$p" == ../* ]]; then
+    p="$PWD/$p"
+  fi
+
+  realp="$(normpath "$p")"
+  # if resolution failed keep original
+  if [ -z "$realp" ]; then
+    realp="$p"
+  fi
+
+  # check deny prefixes
+  for d in "${DENY_PREFIXES[@]}"; do
+    # match prefix
+    case "$realp" in
+      "$d" | "$d"/*)
+        echo "ERROR: docker mount denied. Attempt to mount host path '$realp' under protected prefix '$d'." >&2
+        echo "Refusing to run." >&2
+        exit 1
+        ;;
+    esac
+  done
+done
+
+# all checks passed -> exec real docker
+exec "$REAL_DOCKER" "$@"
