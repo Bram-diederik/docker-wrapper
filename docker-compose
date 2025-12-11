@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# docker-compose wrapper to block host mounts into protected host paths
+REAL_DC=/usr/bin/docker-compose
+
+DENY_PREFIXES=(
+  /etc
+  /root
+  /boot
+  /proc
+  /sys
+  /dev
+  /run
+  /var/run
+  /var/lib
+  /bin
+  /sbin
+  /usr
+  /lib
+  /lib64
+  /selinux
+)
+
+normpath() {
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m "$p" 2>/dev/null || printf "%s" "$p"
+  elif command -v readlink >/dev/null 2>&1; then
+    readlink -f "$p" 2>/dev/null || printf "%s" "$p"
+  else
+    case "$p" in
+      /*) printf "%s" "$p" ;;
+      *) printf "%s/%s" "$PWD" "$p" ;;
+    esac
+  fi
+}
+
+# find compose files passed via -f or --file. If none, default files in current dir are used.
+COMPOSE_FILES=()
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+  a="${args[$i]}"
+  if [[ "$a" == -f || "$a" == --file ]]; then
+    next="${args[$((i+1))]}"
+    if [ -n "$next" ]; then
+      COMPOSE_FILES+=("$next")
+      i=$((i+1))
+    fi
+  elif [[ "$a" == -f* ]]; then
+    COMPOSE_FILES+=("${a#-f}")
+  elif [[ "$a" == --file=* ]]; then
+    COMPOSE_FILES+=("${a#--file=}")
+  fi
+  i=$((i+1))
+done
+
+# defaults if none specified
+if [ ${#COMPOSE_FILES[@]} -eq 0 ]; then
+  if [ -f docker-compose.yml ]; then COMPOSE_FILES+=(docker-compose.yml); fi
+  if [ -f docker-compose.yaml ]; then COMPOSE_FILES+=(docker-compose.yaml); fi
+fi
+
+# no files? nothing to scan -> allow (docker-compose will later complain if missing)
+if [ ${#COMPOSE_FILES[@]} -eq 0 ]; then
+  exec "$REAL_DC" "$@"
+fi
+
+HOST_PATHS=()
+
+# scan files for volume host paths
+for f in "${COMPOSE_FILES[@]}"; do
+  if [ ! -f "$f" ]; then
+    continue
+  fi
+
+  # 1) short syntax lines like "    - ./host/path:/container/path:ro" or "    - /abs/path:/container"
+  # extract left side before first colon when line contains a leading "-"
+  while IFS= read -r line; do
+    # trim leading spaces
+    t="${line#"${line%%[![:space:]]*}"}"
+    # if line starts with - and contains colon and left side starts with / or . or ..
+    if [[ "$t" =~ ^- ]]; then
+      item="${t#- }"
+      # if contains ':' and left side starts with / or . or ..
+      if [[ "$item" =~ ^([./][^:]*|/[^:]*)[:] ]]; then
+        left="${item%%:*}"
+        HOST_PATHS+=("$left")
+      fi
+    fi
+    # long syntax: source: /host/path
+    if [[ "$t" =~ ^source:[[:space:]]*(/[^[:space:]]*) ]]; then
+      HOST_PATHS+=("${BASH_REMATCH[1]}")
+    fi
+  done < "$f"
+
+done
+
+# resolve and check
+for p in "${HOST_PATHS[@]}"; do
+  if [ -z "$p" ]; then continue; fi
+  # skip named volumes (no leading slash and not starting with .)
+  case "$p" in
+    /*) ;;
+    *) 
+      if [[ "$p" != .* && "$p" != ../* ]]; then
+        continue
+      fi
+      ;;
+  esac
+
+  if [[ "$p" == .* || "$p" == ../* ]]; then
+    p="$PWD/$p"
+  fi
+
+  realp="$(normpath "$p")"
+  if [ -z "$realp" ]; then realp="$p"; fi
+
+  for d in "${DENY_PREFIXES[@]}"; do
+    case "$realp" in
+      "$d" | "$d"/*)
+        echo "ERROR: docker-compose denied. compose file attempts to mount host path '$realp' under protected prefix '$d'." >&2
+        echo "Refusing to run." >&2
+        exit 1
+        ;;
+    esac
+  done
+done
+
+# all good
+exec "$REAL_DC" "$@"
