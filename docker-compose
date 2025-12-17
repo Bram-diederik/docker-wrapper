@@ -1,131 +1,85 @@
-#!/usr/bin/env bash
-# docker-compose wrapper to block host mounts into protected host paths
-REAL_DC=/usr/bin/docker-compose
+#!/bin/bash
+command=$@
 
-DENY_PREFIXES=(
-  /
-  /etc
-  /root
-  /boot
-  /proc
-  /sys
-  /dev
-  /run
-  /var/run
-  /var/lib
-  /bin
-  /sbin
-  /usr
-  /lib
-  /lib64
-  /selinux
-)
+# Forbidden mount paths (exact matches)
+forbidden_paths=("/etc" "/" "/dev" "/proc" "/sys" "/boot" "/root" "/var/run/docker.sock")
 
-normpath() {
-  local p="$1"
-  if command -v realpath >/dev/null 2>&1; then
-    realpath -m "$p" 2>/dev/null || printf "%s" "$p"
-  elif command -v readlink >/dev/null 2>&1; then
-    readlink -f "$p" 2>/dev/null || printf "%s" "$p"
-  else
-    case "$p" in
-      /*) printf "%s" "$p" ;;
-      *) printf "%s/%s" "$PWD" "$p" ;;
-    esac
-  fi
+# Function to resolve real paths, following symlinks
+resolve_path() {
+    local path="$1"
+    
+    # Use readlink to resolve symbolic (soft) links
+    real_path=$(readlink -f "$path")
+    
+    if [[ -z "$real_path" ]]; then
+        real_path="$path"  # If readlink fails, fallback to the original path
+    fi
+    
+    echo "$real_path"
 }
 
-# find compose files passed via -f or --file. If none, default files in current dir are used.
-COMPOSE_FILES=()
-args=("$@")
-i=0
-while [ $i -lt ${#args[@]} ]; do
-  a="${args[$i]}"
-  if [[ "$a" == -f || "$a" == --file ]]; then
-    next="${args[$((i+1))]}"
-    if [ -n "$next" ]; then
-      COMPOSE_FILES+=("$next")
-      i=$((i+1))
-    fi
-  elif [[ "$a" == -f* ]]; then
-    COMPOSE_FILES+=("${a#-f}")
-  elif [[ "$a" == --file=* ]]; then
-    COMPOSE_FILES+=("${a#--file=}")
-  fi
-  i=$((i+1))
-done
+# Function to check for forbidden mount paths, including symlinks
+check_mount_paths() {
+    for path in "$@"; do
+        real_path=$(resolve_path "$path")  # Resolve symlinks
+        for forbidden in "${forbidden_paths[@]}"; do
+            if [[ "$real_path" == "$forbidden" || "$real_path" == "$forbidden/"* ]]; then
+                echo "Error: Attempting to mount forbidden path: $forbidden"
+                exit 1
+            fi
+        done
+    done
+}
 
-# defaults if none specified
-if [ ${#COMPOSE_FILES[@]} -eq 0 ]; then
-  if [ -f docker-compose.yml ]; then COMPOSE_FILES+=(docker-compose.yml); fi
-  if [ -f docker-compose.yaml ]; then COMPOSE_FILES+=(docker-compose.yaml); fi
-fi
+# Function to parse and check the compose YAML files
+check_docker_compose_file() {
+    local file="$1"
+    
+    # Extract all volume mount sources from the YAML file and check them
+    local mounts=$(grep -Po '(?<=- )[^\s]+(?=:)' "$file")
+    
+    for mount in $mounts; do
+        check_mount_paths "$mount"
+    done
+}
 
-# no files? nothing to scan -> allow (docker-compose will later complain if missing)
-if [ ${#COMPOSE_FILES[@]} -eq 0 ]; then
-  exec "$REAL_DC" "$@"
-fi
-
-HOST_PATHS=()
-
-# scan files for volume host paths
-for f in "${COMPOSE_FILES[@]}"; do
-  if [ ! -f "$f" ]; then
-    continue
-  fi
-
-  # 1) short syntax lines like "    - ./host/path:/container/path:ro" or "    - /abs/path:/container"
-  # extract left side before first colon when line contains a leading "-"
-  while IFS= read -r line; do
-    # trim leading spaces
-    t="${line#"${line%%[![:space:]]*}"}"
-    # if line starts with - and contains colon and left side starts with / or . or ..
-    if [[ "$t" =~ ^- ]]; then
-      item="${t#- }"
-      # if contains ':' and left side starts with / or . or ..
-      if [[ "$item" =~ ^([./][^:]*|/[^:]*)[:] ]]; then
-        left="${item%%:*}"
-        HOST_PATHS+=("$left")
-      fi
-    fi
-    # long syntax: source: /host/path
-    if [[ "$t" =~ ^source:[[:space:]]*(/[^[:space:]]*) ]]; then
-      HOST_PATHS+=("${BASH_REMATCH[1]}")
-    fi
-  done < "$f"
-
-done
-
-# resolve and check
-for p in "${HOST_PATHS[@]}"; do
-  if [ -z "$p" ]; then continue; fi
-  # skip named volumes (no leading slash and not starting with .)
-  case "$p" in
-    /*) ;;
-    *) 
-      if [[ "$p" != .* && "$p" != ../* ]]; then
-        continue
-      fi
-      ;;
-  esac
-
-  if [[ "$p" == .* || "$p" == ../* ]]; then
-    p="$PWD/$p"
-  fi
-
-  realp="$(normpath "$p")"
-  if [ -z "$realp" ]; then realp="$p"; fi
-
-  for d in "${DENY_PREFIXES[@]}"; do
-    case "$realp" in
-      "$d" | "$d"/*)
-        echo "ERROR: docker-compose denied. compose file attempts to mount host path '$realp' under protected prefix '$d'." >&2
-        echo "Refusing to run." >&2
-        exit 1
-        ;;
+# Determine the YAML file(s) used by docker-compose
+yaml_files=()
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -f|--file)
+            shift
+            yaml_files+=("$1")
+            ;;
     esac
-  done
+    shift
 done
 
-# all good
-exec "$REAL_DC" "$@"
+# If no -f flag was passed, check files in order of preference:
+if [[ ${#yaml_files[@]} -eq 0 ]]; then
+    if [[ -f "compose.yaml" ]]; then
+        yaml_files+=("compose.yaml")
+    elif [[ -f "compose.yml" ]]; then
+        yaml_files+=("compose.yml")
+    elif [[ -f "docker-compose.yaml" ]]; then
+        yaml_files+=("docker-compose.yaml")
+    elif [[ -f "docker-compose.yml" ]]; then
+        yaml_files+=("docker-compose.yml")
+    else
+        echo "Error: No compose file found in the current directory."
+        exit 1
+    fi
+fi
+
+# Check each compose file for forbidden mounts
+for yaml_file in "${yaml_files[@]}"; do
+    if [[ -f "$yaml_file" ]]; then
+        check_docker_compose_file "$yaml_file"
+    else
+        echo "Error: Specified docker-compose file not found: $yaml_file"
+        exit 1
+    fi
+done
+
+# Execute the real docker-compose command
+/usr/bin/docker-compose $command
