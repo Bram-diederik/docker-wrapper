@@ -3,6 +3,7 @@
 REAL_DC=/usr/bin/docker-compose
 
 DENY_PREFIXES=(
+  /
   /etc
   /root
   /boot
