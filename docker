@@ -6,6 +6,7 @@ REAL_DOCKER=/usr/bin/docker
 
 # deny list (prefixes). Any resolved host path under any of these -> rejected.
 DENY_PREFIXES=(
+  /
   /etc
   /root
   /boot
